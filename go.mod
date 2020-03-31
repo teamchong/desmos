@@ -15,4 +15,4 @@ require (
 	github.com/tendermint/tm-db v0.4.0
 )
 
-replace github.com/tendermint/tendermint => /Users/kwunyueng/go/src/github.com/desmos-labs/tendermint
+replace github.com/tendermint/tendermint => github.com/desmos-labs/tendermint v0.33.1-0.20200331162612-78ff992370a0
