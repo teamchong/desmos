@@ -21,22 +21,13 @@ output_file = f"{build_dir}/output_state.json"
 with requests.get(chain_state_url) as r, open(chain_state_file, 'w') as f:
     f.write(json.dumps(r.json()))
 
-with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as genesis_f, open(output_file, 'w') as out:
-    chain_state = json.load(chain_state_f)
-    genesis = json.load(genesis_f)
 
-    chain_state['genesis_time'] = genesis['genesis_time']
-    chain_state['chain_id'] = genesis['chain_id']
-    chain_state['initial_height'] = genesis['initial_height']
-    chain_state['app_state']['auth']['accounts'] += genesis['app_state']['auth']['accounts']
-
-    # Transform the gentxs into validators
-    genesis_validators = []
-    genesis_delegations = []
-    tendermint_validators = []
-    for gentx in genesis['app_state']['genutil']['gen_txs']:
+def get_genesis_validators_delegations(gentxs: [dict]):
+    __validators = []
+    __delegations = []
+    for gentx in gentxs:
         message = gentx['body']['messages'][0]
-        genesis_validators.append({
+        __validators.append({
             'commission': {
                 'commission_rates': message['commission'],
                 'update_time': genesis['genesis_time']
@@ -52,17 +43,24 @@ with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as ge
             'unbonding_height': '0',
             'unbonding_time': '1970-01-01T00:00:00Z'
         })
-        genesis_delegations.append({
+        __delegations.append({
             'delegator_address': message['delegator_address'],
             'validator_address': message['validator_address'],
             'shares': message['value']['amount']
         })
 
+    return __validators, __delegations
+
+
+def get_tendermint_validators(gentxs: [dict]):
+    __validators = []
+    for gentx in gentxs:
+        message = gentx['body']['messages'][0]
         pubkey = base64.b64decode(message['pubkey']['key'].encode('ascii'))
         alg = hashlib.sha256()
         alg.update(pubkey)
 
-        tendermint_validators.append({
+        __validators.append({
             'address': alg.digest()[:20].hex(),
             'name': message['description']['moniker'],
             'power': message['value']['amount'],
@@ -71,88 +69,160 @@ with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as ge
                 'value': message['pubkey']['key']
             }
         })
+    return __validators
 
-    del (genesis['app_state']['genutil'])
+
+with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as genesis_f, open(output_file, 'w') as out:
+    chain_state = json.load(chain_state_f)
+    genesis = json.load(genesis_f)
+
+    chain_state['genesis_time'] = genesis['genesis_time']
+    chain_state['chain_id'] = genesis['chain_id']
+    chain_state['initial_height'] = genesis['initial_height']
+    chain_state['app_state']['auth']['accounts'] += genesis['app_state']['auth']['accounts']
+
+    # Transform the gentxs into validators and delegations
+    gentxs = genesis['app_state']['genutil']['gen_txs']
+    genesis_validators, genesis_delegations = get_genesis_validators_delegations(gentxs)
+    tendermint_validators = get_tendermint_validators(gentxs)
 
     # -------------------------------
     # --- Update the staking state
-    for validator in chain_state['app_state']['staking']['validators']:
-        validator['status'] = 'BOND_STATUS_UNBONDED'
-
-    chain_state['app_state']['staking']['validators'] = genesis_validators
 
     # Change all the delegations so that they are delegated to the first validator
-    changed_validators = []
-    added_shares = 0.0
-    validator_address = genesis_validators[0]['operator_address']
-    for delegation in chain_state['app_state']['staking']['delegations']:
-        added_shares += float(delegation['shares'])
-        changed_validators.append(delegation['validator_address'])
+    delegations = chain_state['app_state']['staking']['delegations']
+    for __delegation in delegations:
+        __delegation['validator_address'] = genesis_validators[0]['operator_address']
+    delegations += genesis_delegations
 
-        delegation['validator_address'] = validator_address
+    # Get the maps of validator -> [delegation]
+    validators_delegations = {}
+    for __delegation in delegations:
+        __validator_address = __delegation['validator_address']
+        __delegations = validators_delegations.get(__validator_address, [])
+        __delegations.append(__delegation)
+        validators_delegations[__validator_address] = __delegations
 
-    # Update the delegator shares:
-    # - set the old validators to 0
-    # - add the added_shares amount to the first validator
-    for changed_validator in changed_validators:
-        for validator in chain_state['app_state']['staking']['validators']:
-            if validator['operator_address'] == validator_address:
-                validator['delegator_shares'] = '20017455415180.588050795495252068'
+    # Merge the delegations for the same delegator and validator together
+    final_delegations = []
+    for validator, delegations in validators_delegations.items():
+        # Map delegator -> shares
+        __delegator_shares = {}
+        for __delegation in delegations:
+            __delegator_address = __delegation.get('delegator_address')
+            __shares = float(__delegator_shares.get(__delegator_address, '0'))
+            __shares += float(__delegation.get('shares'))
+            __delegator_shares[__delegator_address] = "{:.0f}".format(__shares)
 
-            if validator['operator_address'] == changed_validator:
-                validator['delegator_shares'] = '0'
+        for delegator, shares in __delegator_shares.items():
+            final_delegations.append({
+                'delegator_address': delegator,
+                'validator_address': validator,
+                'shares': shares
+            })
 
-    chain_state['app_state']['staking']['delegations'] += genesis_delegations
-    del (chain_state['app_state']['staking']['redelegations'])
+    # Remove all 0 shares delegations
+    for __delegation in final_delegations:
+        __delegation_shares = float(__delegation.get('shares'))
+        if __delegation_shares < 1:
+            final_delegations.remove(__delegation)
 
-    last_validator_powers = []
+    validators_delegators_shares = {}
+    for __delegation in final_delegations:
+        __validator_address = __delegation.get('validator_address')
+        __validator_shares = float(validators_delegators_shares.get(__validator_address, '0'))
+        __validator_shares += __delegation_shares
+        validators_delegators_shares[__validator_address] = "{:.0f}".format(__validator_shares)
+
+    # Update the validator delegator shares
     for validator in genesis_validators:
-        last_validator_powers.append({
+        __shares = validators_delegators_shares.get(validator['operator_address'], '0')
+        validator['delegator_shares'] = __shares
+
+    # Update the validator voting powers
+    final_voting_powers = []
+    for validator in genesis_validators:
+        final_voting_powers.append({
             'address': validator['operator_address'],
             'power': validator['tokens']
         })
-    chain_state['app_state']['staking']['last_validator_powers'] = last_validator_powers
 
-    # -------------------------------
+    # Set the final staking state:
+    # - validators to only be the genesis ones
+    # - validator voting powers
+    # - correct delegations
+    # - delete the redelegations
+    chain_state['app_state']['staking']['validators'] = genesis_validators
+    chain_state['app_state']['staking']['last_validator_powers'] = final_voting_powers
+    chain_state['app_state']['staking']['delegations'] = final_delegations
+    del (chain_state['app_state']['staking']['redelegations'])
+
+    # -----------------------------------------
     # --- Update the distribution state
-    genesis_initial_distribution = []
-    genesis_validator_historical_rewards = []
-    for delegation in genesis_delegations:
-        genesis_initial_distribution.append({
-            'delegator_address': delegation['delegator_address'],
+
+    # Get the validator starting info
+    validator_periods = {}
+    genesis_starting_info = []
+    for __delegation in final_delegations:
+        __validator_address = __delegation['validator_address']
+
+        # Increment of 1 the period
+        __period = validator_periods.get(__validator_address, 0) + 1
+
+        # Store the starting info
+        genesis_starting_info.append({
+            'delegator_address': __delegation['delegator_address'],
             'starting_info': {
                 'height': genesis['initial_height'],
-                'previous_period': '1',
-                'stake': delegation['shares']
+                'previous_period': str(__period),
+                'stake': __delegation['shares']
             },
-            'validator_address': delegation['validator_address']
-        })
-        genesis_validator_historical_rewards.append({
-            'period': '0',
-            'rewards': {
-                'cumulative_reward_ratio': [],
-                'reference_count': 1,
-            },
-            'validator_address': delegation['validator_address']
+            'validator_address': __validator_address
         })
 
-    chain_state['app_state']['distribution']['delegator_starting_infos'] = genesis_initial_distribution
+        # Store the updated period
+        validator_periods[__validator_address] = __period
+
+    # Get the historical rewards info
+    genesis_current_rewards = []
+    genesis_validator_historical_rewards = []
+    for __validator, __period in validator_periods.items():
+        genesis_current_rewards.append({
+            'rewards': {
+                'period': str(__period_number + 1),
+                'rewards': []
+            },
+            'validator_address': __validator
+        })
+
+        for __period_number in range(0, __period):
+            genesis_validator_historical_rewards.append({
+                'period': str(__period_number + 1),
+                'rewards': {
+                    'cumulative_reward_ratio': [],
+                    'reference_count': 1,
+                },
+                'validator_address': __validator
+            })
+
+    chain_state['app_state']['distribution']['delegator_starting_infos'] = genesis_starting_info
     chain_state['app_state']['distribution']['validator_historical_rewards'] = genesis_validator_historical_rewards
     chain_state['app_state']['distribution']['outstanding_rewards'] = []
-    chain_state['app_state']['distribution']['validator_current_rewards'] = []
+    chain_state['app_state']['distribution']['validator_current_rewards'] = genesis_current_rewards
     chain_state['app_state']['distribution']['validator_accumulated_commissions'] = []
+    chain_state['app_state']['distribution']['validator_slash_events'] = []
 
-    # Update the distribution starting info
-    for changed_validator in changed_validators:
-        for distribution_info in chain_state['app_state']['distribution']['delegator_starting_infos']:
-            if distribution_info['validator_address'] == changed_validator:
-                distribution_info['validator_address'] = validator_address
+    # # Update the distribution starting info
+    # for changed_validator in changed_validators:
+    #     for distribution_info in chain_state['app_state']['distribution']['delegator_starting_infos']:
+    #         if distribution_info['validator_address'] == changed_validator:
+    #             distribution_info['validator_address'] = validator_address
 
     # -------------------------------
     # --- Update the bank state
     delegated_amount = 0
-    for delegation in genesis_delegations:
-        delegated_amount += int(delegation['shares'])
+    for __delegation in genesis_delegations:
+        delegated_amount += int(__delegation['shares'])
 
     chain_state['app_state']['bank']['balances'] += genesis['app_state']['bank']['balances']
     for balance in chain_state['app_state']['bank']['balances']:
@@ -173,18 +243,18 @@ with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as ge
 
     signing_infos = []
     for idx, validator in enumerate(tendermint_validators):
-        signing_info = chain_state['app_state']['slashing']['signing_infos'][idx]
-        five_bits_r = bech32.convertbits(bytearray.fromhex(validator['address']), 8, 5)
-        cons_addr = bech32.bech32_encode('desmosvalcons', five_bits_r)
+        __signing_info = chain_state['app_state']['slashing']['signing_infos'][idx]
+        __five_bits_r = bech32.convertbits(bytearray.fromhex(validator['address']), 8, 5)
+        __cons_addr = bech32.bech32_encode('desmosvalcons', __five_bits_r)
         signing_infos.append({
-            'address': cons_addr,
+            'address': __cons_addr,
             'validator_signing_info': {
-                "address": cons_addr,
-                'index_offset': signing_info['validator_signing_info']['index_offset'],
-                'jailed_until': signing_info['validator_signing_info']['jailed_until'],
-                'missed_blocks_counter': signing_info['validator_signing_info']['missed_blocks_counter'],
-                'start_height': signing_info['validator_signing_info']['start_height'],
-                'tombstoned': signing_info['validator_signing_info']['tombstoned']
+                "address": __cons_addr,
+                'index_offset': __signing_info['validator_signing_info']['index_offset'],
+                'jailed_until': __signing_info['validator_signing_info']['jailed_until'],
+                'missed_blocks_counter': __signing_info['validator_signing_info']['missed_blocks_counter'],
+                'start_height': __signing_info['validator_signing_info']['start_height'],
+                'tombstoned': __signing_info['validator_signing_info']['tombstoned']
             }
         })
 
@@ -204,6 +274,8 @@ with open(chain_state_file, 'r') as chain_state_f, open(genesis_file, 'r') as ge
     # --- Clear the validators list
 
     chain_state['validators'] = tendermint_validators
+
+    del (genesis['app_state']['genutil'])
 
     # -------------------------------
     # --- Write the file
